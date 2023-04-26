@@ -1,6 +1,16 @@
-async function setup() {
-    const patchExportURL = "export/patch.export.json";
+// midi device: "midi-maker" patch. generates midi notes (no input needed).
+// taken directly from RNBO's chaining-midi patch.
+let midiDevice;
 
+// synthdevice: "simple-synth" patch. takes in midi notes, outputs signal.
+// taken directly from RNBO's chaining-midi patch.
+let synthDevice;
+
+// midiChordGeneratorDevice: an RNBO patch that takes in midi input and
+// generates major or minor chords (sequence of notes) & sends that to midiout.
+let midiChordGeneratorDevice;
+
+async function setup() {
     // Create AudioContext
     const WAContext = window.AudioContext || window.webkitAudioContext;
     const context = new WAContext();
@@ -8,94 +18,152 @@ async function setup() {
     // Create gain node and connect it to audio output
     const outputNode = context.createGain();
     outputNode.connect(context.destination);
-    
-    // Fetch the exported patcher
-    let response, patcher;
-    try {
-        response = await fetch(patchExportURL);
-        patcher = await response.json();
-    
-        if (!window.RNBO) {
-            // Load RNBO script dynamically
-            // Note that you can skip this by knowing the RNBO version of your patch
-            // beforehand and just include it using a <script> tag
-            await loadRNBOScript(patcher.desc.meta.rnboversion);
-        }
 
-    } catch (err) {
-        const errorContext = {
-            error: err
-        };
-        if (response && (response.status >= 300 || response.status < 200)) {
-            errorContext.header = `Couldn't load patcher export bundle`,
-            errorContext.description = `Check app.js to see what file it's trying to load. Currently it's` +
-            ` trying to load "${patchExportURL}". If that doesn't` + 
-            ` match the name of the file you exported from RNBO, modify` + 
-            ` patchExportURL in app.js.`;
-        }
-        if (typeof guardrails === "function") {
-            guardrails(errorContext);
-        } else {
-            throw err;
-        }
-        return;
-    }
-    
-    // (Optional) Fetch the dependencies
-    let dependencies = [];
-    try {
-        const dependenciesResponse = await fetch("export/dependencies.json");
-        dependencies = await dependenciesResponse.json();
+    // load a patcher that generates midi notes (no input needed)
+    let response = await fetch("export/midi-maker.export.json");
+    let midiPatcher = await response.json();
 
-        // Prepend "export" to any file dependenciies
-        dependencies = dependencies.map(d => d.file ? Object.assign({}, d, { file: "export/" + d.file }) : d);
-    } catch (e) {}
+    // load a patcher that accepts a midi note input and generates
+    // a sequence of notes (to be played as a chord) by synth device
+    response = await fetch("export/random_chords.export.json");
+    let midiChordGeneratorPatcher = await response.json();
 
-    // Create the device
-    let device;
-    try {
-        device = await RNBO.createDevice({ context, patcher });
-    } catch (err) {
-        if (typeof guardrails === "function") {
-            guardrails({ error: err });
-        } else {
-            throw err;
-        }
-        return;
+    // load a patcher that has a midi input and signal outs
+    response = await fetch("export/patch.export.json");
+    let synthPatcher = await response.json();
+    let patcher = midiPatcher;
+
+    if (!window.RNBO) {
+        // Load RNBO script dynamically
+        // Note that you can skip this by knowing the RNBO version of your patch
+        // beforehand and just include it using a <script> tag
+        await loadRNBOScript(patcher.desc.meta.rnboversion);
     }
 
-    // (Optional) Load the samples
-    if (dependencies.length)
-        await device.loadDataBufferDependencies(dependencies);
+    document.body.onclick = (_) => context.resume();
 
-    // Connect the device to the web audio graph
-    device.node.connect(outputNode);
+    midiDevice = await RNBO.createDevice({ context, patcher: midiPatcher });
+    midiChordGeneratorDevice = await RNBO.createDevice({ context, patcher: midiChordGeneratorPatcher });
+    synthDevice = await RNBO.createDevice({ context, patcher: synthPatcher });
+    synthDevice.node.connect(outputNode);
 
-    // (Optional) Extract the name and rnbo version of the patcher from the description
-    document.getElementById("patcher-title").innerText = (patcher.desc.meta.filename || "Unnamed Patcher") + " (v" + patcher.desc.meta.rnboversion + ")";
+    // set up message event listeners
+    midiDevice.messageEvent.subscribe((ev) => {
+        console.log(`MIDI Received message ${ev.tag}: ${ev.payload}`);
+        if (ev.tag === "out1") console.log("from the first outlet");
+    });
+
+    midiChordGeneratorDevice.messageEvent.subscribe((ev) => {
+        console.log(`MIDI CHORD GENERATOR Received message ${ev.tag}: ${ev.payload}`);
+        if (ev.tag === "out1") console.log("from the first outlet");
+    });
+
+    synthDevice.messageEvent.subscribe((ev) => {
+        console.log(`SYNTH Received message ${ev.tag}: ${ev.payload}`);
+        if (ev.tag === "out1") console.log("from the first outlet");
+    });
+
+    // set up midi event listeners
+    synthDevice.midiEvent.subscribe((ev) => {
+        console.log(`SYNTH Received MIDI EVENT ${ev} ${ev.data}`);
+        // Handle the outgoing MIDIEvent
+        let type = ev.data[0];
+    
+        // Test for note on
+        if (type >> 4 === 9) {
+            let pitch = ev.data[1];
+            let velocity = ev.data[2];
+            console.log(`Received MIDI note on with pitch ${pitch} and velocity ${velocity}`);
+        }
+    });
+
+    midiDevice.midiEvent.subscribe((ev) => {
+        console.log(`MIDIDEVICE Received MIDI EVENT ${ev}: ${ev.data}`);
+        // Handle the outgoing MIDIEvent
+        let type = ev.data[0];
+    
+        // Test for note on
+        if (type >> 4 === 9) {
+            let pitch = ev.data[1];
+            let velocity = ev.data[2];
+            console.log(`Received MIDI note on with pitch ${pitch} and velocity ${velocity}`);
+        }
+
+        // forward to synth device
+        synthDevice.scheduleEvent(ev);
+    });
+
+    midiChordGeneratorDevice.midiEvent.subscribe((ev) => {
+        console.log(`MIDICHORDGENERATOR Received MIDI EVENT ${ev}: ${ev.data}`);
+
+        // Handle the outgoing MIDIEvent
+        let type = ev.data[0];
+    
+        // Test for note on
+        if (type >> 4 === 9) {
+            let pitch = ev.data[1];
+            let velocity = ev.data[2];
+            console.log(`Received MIDI note on with pitch ${pitch} and velocity ${velocity}`);
+        }
+
+        // forward to synth device
+        synthDevice.scheduleEvent(ev);
+    });
 
     // (Optional) Automatically create sliders for the device parameters
-    makeSliders(device);
+    makeSliders(midiChordGeneratorDevice);
+    makeSliders(synthDevice);
+    makeSliders(midiDevice);
 
     // (Optional) Create a form to send messages to RNBO inputs
-    makeInportForm(device);
+    makeInportForm(midiDevice);
 
     // (Optional) Attach listeners to outports so you can log messages from the RNBO patcher
-    attachOutports(device);
+    attachOutports(midiDevice);
 
     // (Optional) Load presets, if any
-    loadPresets(device, patcher);
+    loadPresets(midiChordGeneratorDevice, patcher);
 
     // (Optional) Connect MIDI inputs
-    makeMIDIKeyboard(device);
+    makeMIDIKeyboard(midiChordGeneratorDevice, midiChordGeneratorPatcher.desc.meta.filename);
+    makeMIDIKeyboard(synthDevice, synthPatcher.desc.meta.filename);
 
-    document.body.onclick = () => {
-        context.resume();
-    }
+    //alert('click midi keyboard to send midi notes to "midiChordGeneratorDevice" and route to "simpleSynth"');
 
     // Skip if you're not using guardrails.js
     if (typeof guardrails === "function")
         guardrails();
+}
+
+// Sends a note to a device.
+function sendNoteToDevice(note, device) {
+    console.log(device);
+    console.log(`send note ${note} to device`);
+    let midiChannel = 0;
+
+    // Format a MIDI message paylaod, this constructs a MIDI on event
+    let noteOnMessage = [
+        144 + midiChannel, // Code for a note on: 10010000 & midi channel (0-15)
+        note, // MIDI Note
+        127 // MIDI Velocity
+    ];
+
+    let noteOffMessage = [
+        128 + midiChannel, // Code for a note off: 10000000 & midi channel (0-15)
+        note, // MIDI Note
+        0 // MIDI Velocity
+    ];
+
+    // Including rnbo.min.js (or the unminified rnbo.js) will add the RNBO object
+    // to the global namespace. This includes the TimeNow constant as well as
+    // the MIDIEvent constructor.
+    let midiPort = 0;
+    let noteDurationMs = 500;
+
+    let deviceNoteOnEvent = new RNBO.MIDIEvent(device.context.currentTime * 1000, midiPort, noteOnMessage);
+    let deviceNoteOffEvent = new RNBO.MIDIEvent(device.context.currentTime * 1000 + noteDurationMs, midiPort, noteOffMessage);
+    device.scheduleEvent(deviceNoteOnEvent);
+    device.scheduleEvent(deviceNoteOffEvent);
 }
 
 function loadRNBOScript(version) {
@@ -285,11 +353,16 @@ function loadPresets(device, patcher) {
     presetSelect.onchange = () => device.setPreset(presets[presetSelect.value].preset);
 }
 
-function makeMIDIKeyboard(device) {
+function makeMIDIKeyboard(device, name) {
     let mdiv = document.getElementById("rnbo-clickable-keyboard");
     if (device.numMIDIInputPorts === 0) return;
 
-    mdiv.removeChild(document.getElementById("no-midi-label"));
+    let container = document.createElement("div");
+    container.classList.add("keyboard");
+    let p = document.createElement("p");
+    p.textContent = `send a note to ${name}`;
+    mdiv.appendChild(p);
+    mdiv.appendChild(container);
 
     const midiNotes = [49, 52, 56, 63];
     midiNotes.forEach(note => {
@@ -298,41 +371,13 @@ function makeMIDIKeyboard(device) {
         label.textContent = note;
         key.appendChild(label);
         key.addEventListener("pointerdown", () => {
-            let midiChannel = 0;
-
-            // Format a MIDI message paylaod, this constructs a MIDI on event
-            let noteOnMessage = [
-                144 + midiChannel, // Code for a note on: 10010000 & midi channel (0-15)
-                note, // MIDI Note
-                100 // MIDI Velocity
-            ];
-        
-            let noteOffMessage = [
-                128 + midiChannel, // Code for a note off: 10000000 & midi channel (0-15)
-                note, // MIDI Note
-                0 // MIDI Velocity
-            ];
-        
-            // Including rnbo.min.js (or the unminified rnbo.js) will add the RNBO object
-            // to the global namespace. This includes the TimeNow constant as well as
-            // the MIDIEvent constructor.
-            let midiPort = 0;
-            let noteDurationMs = 250;
-        
-            // When scheduling an event to occur in the future, use the current audio context time
-            // multiplied by 1000 (converting seconds to milliseconds) for now.
-            let noteOnEvent = new RNBO.MIDIEvent(device.context.currentTime * 1000, midiPort, noteOnMessage);
-            let noteOffEvent = new RNBO.MIDIEvent(device.context.currentTime * 1000 + noteDurationMs, midiPort, noteOffMessage);
-        
-            device.scheduleEvent(noteOnEvent);
-            device.scheduleEvent(noteOffEvent);
-
+            sendNoteToDevice(note, device);
             key.classList.add("clicked");
         });
 
         key.addEventListener("pointerup", () => key.classList.remove("clicked"));
 
-        mdiv.appendChild(key);
+        container.appendChild(key);
     });
 }
 
